@@ -1,0 +1,45 @@
+# Test backend, deliberately in a namespace without the adbc-relay.io/enabled label.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: relay-backend
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pg
+  namespace: relay-backend
+spec:
+  selector:
+    matchLabels: {app: pg}
+  template:
+    metadata:
+      labels: {app: pg}
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17
+          env:
+            - {name: POSTGRES_PASSWORD, value: test-superuser-password}
+          ports:
+            - containerPort: 5432
+          readinessProbe:
+            exec:
+              command: [pg_isready, -U, postgres, -h, 127.0.0.1]
+            periodSeconds: 2
+          volumeMounts:
+            - {name: seed, mountPath: /docker-entrypoint-initdb.d}
+      volumes:
+        - name: seed
+          configMap:
+            name: pg-seed
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg
+  namespace: relay-backend
+spec:
+  selector: {app: pg}
+  ports:
+    - port: 5432

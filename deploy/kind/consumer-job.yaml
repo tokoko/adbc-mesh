@@ -1,0 +1,23 @@
+# Note what's missing: no sidecar, no credentials, no security context. The label asks for them.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: consumer
+  namespace: relay-test
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        adbc-relay.io/backend: postgres
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: app
+          image: relay-consumer:dev
+          imagePullPolicy: IfNotPresent
+          command: [python, /test/consumer_test.py]
+          env:
+            - {name: RELAY_SOCK, value: /run/adbc-relay/postgres.sock}
+            - {name: BACKEND_HOST, value: pg.relay-backend.svc.cluster.local}
+            - {name: EXPECT_ISOLATED, value: "1"}

@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: relay-test
+  labels:
+    adbc-relay.io/enabled: "true"
+    pod-security.kubernetes.io/enforce: baseline
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: adbc-relay-postgres
+  namespace: relay-test
+stringData:
+  uri: postgresql://relay_reader:s3cr3t-pg-password@pg.relay-backend.svc.cluster.local:5432/postgres
+  config.json: |
+    {"socket": "/run/adbc-relay/postgres.sock",
+     "driver": {"name": "/opt/relay/libadbc_driver_postgresql.so",
+                "options_from_files": {"uri": "/etc/adbc-relay/uri"}},
+     "max_outstanding_bytes": 805306368}
+---
+# Fixture: exists so the e2e test can show that the policy, not a missing account, refuses it.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: some-powerful-account
+  namespace: relay-test

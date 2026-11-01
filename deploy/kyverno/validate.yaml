@@ -1,0 +1,218 @@
+# Mutation is not a security boundary on its own. These run after it and check the final pod.
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: adbc-relay-credentials
+spec:
+  failurePolicy: Fail
+  validationActions: [Deny]
+  autogen:
+    podControllers:
+      controllers: []
+    # Enforce natively in the API server. Kyverno deletes its webhooks when scaled to zero, and with
+    # them anything that only a webhook was enforcing.
+    validatingAdmissionPolicy:
+      enabled: true
+  # Secrets can only be referenced from their own namespace, so scoping to labelled namespaces
+  # covers them, and a Kyverno outage can't block pods anywhere else.
+  matchConstraints:
+    namespaceSelector:
+      matchLabels:
+        adbc-relay.io/enabled: "true"
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods", "pods/ephemeralcontainers"]
+  variables:
+    - name: all
+      expression: >-
+        object.spec.containers
+        + (has(object.spec.initContainers) ? object.spec.initContainers : [])
+        + (has(object.spec.ephemeralContainers) ? object.spec.ephemeralContainers : [])
+    - name: credentialVolumes
+      expression: >-
+        (has(object.spec.volumes) ? object.spec.volumes : []).filter(v,
+          (has(v.secret) && has(v.secret.secretName) && v.secret.secretName.startsWith("adbc-relay-")) ||
+          (has(v.projected) && has(v.projected.sources) && v.projected.sources.exists(s,
+            has(s.secret) && has(s.secret.name) && s.secret.name.startsWith("adbc-relay-")))
+        ).map(v, v.name)
+    - name: others
+      expression: "variables.all.filter(c, c.name != 'relay-sidecar')"
+  validations:
+    - message: "only an injected relay pod may reference adbc-relay credentials"
+      expression: >-
+        size(variables.credentialVolumes) == 0 ||
+        (has(object.metadata.labels) && "adbc-relay.io/backend" in object.metadata.labels)
+    - message: "only relay-sidecar may mount adbc-relay credentials"
+      expression: >-
+        variables.others.all(c, !has(c.volumeMounts) ||
+          c.volumeMounts.all(m, !(m.name in variables.credentialVolumes)))
+    # A pod can project a token for any audience without RBAC, so a Vault-audience token is as
+    # good as the credentials it unlocks.
+    - message: "only the injected relay-token volume may hold a token for the vault audience"
+      expression: >-
+        (has(object.spec.volumes) ? object.spec.volumes : []).all(v,
+          !has(v.projected) || !has(v.projected.sources) || v.projected.sources.all(s,
+            !has(s.serviceAccountToken) || !has(s.serviceAccountToken.audience) ||
+            s.serviceAccountToken.audience != "vault" ||
+            (v.name == "relay-token" && has(object.metadata.labels) && "adbc-relay.io/backend" in object.metadata.labels)))
+    - message: "adbc-relay credentials may not be used through environment variables"
+      expression: >-
+        variables.all.all(c,
+          (!has(c.env) || c.env.all(e, !has(e.valueFrom) || !has(e.valueFrom.secretKeyRef) ||
+            !e.valueFrom.secretKeyRef.name.startsWith("adbc-relay-"))) &&
+          (!has(c.envFrom) || c.envFrom.all(e, !has(e.secretRef) ||
+            !e.secretRef.name.startsWith("adbc-relay-"))))
+---
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: adbc-relay-pod-shape
+spec:
+  failurePolicy: Fail
+  validationActions: [Deny]
+  autogen:
+    podControllers:
+      controllers: []
+    # Enforce natively in the API server. Kyverno deletes its webhooks when scaled to zero, and with
+    # them anything that only a webhook was enforcing.
+    validatingAdmissionPolicy:
+      enabled: true
+  matchConstraints:
+    namespaceSelector:
+      matchLabels:
+        adbc-relay.io/enabled: "true"
+    objectSelector:
+      matchExpressions:
+        - {key: adbc-relay.io/backend, operator: Exists}
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods", "pods/ephemeralcontainers"]
+  variables:
+    - name: init
+      expression: "has(object.spec.initContainers) ? object.spec.initContainers : []"
+    - name: untrusted
+      expression: >-
+        object.spec.containers + variables.init.filter(c, c.name != 'relay-sidecar')
+    - name: podUid
+      expression: >-
+        has(object.spec.securityContext) && has(object.spec.securityContext.runAsUser)
+        ? object.spec.securityContext.runAsUser : 0
+  validations:
+    - message: "relay pods must keep the adbc-relay.io/backend label"
+      expression: "has(object.metadata.labels) && 'adbc-relay.io/backend' in object.metadata.labels"
+    - message: "relay-sidecar must run first, with the approved image and no overrides"
+      expression: >-
+        size(variables.init) >= 1 &&
+        variables.init[0].name == "relay-sidecar" && variables.init[0].image == "relay-sidecar:dev" &&
+        !has(variables.init[0].command) &&
+        variables.init[0].args == ["/etc/adbc-relay/config.json"]
+    - message: "relay pods may not share a process namespace"
+      expression: "!(has(object.spec.shareProcessNamespace) && object.spec.shareProcessNamespace)"
+    - message: "relay pods may not mount other service account tokens"
+      expression: >-
+        has(object.spec.automountServiceAccountToken) && !object.spec.automountServiceAccountToken &&
+        (!has(object.spec.volumes) || object.spec.volumes.all(v,
+          (!has(v.projected) || !has(v.projected.sources) || v.projected.sources.all(s, !has(s.serviceAccountToken) ||
+            (v.name == "relay-token" && has(s.serviceAccountToken.audience) && s.serviceAccountToken.audience == "vault")))))
+    - message: "only relay-sidecar may mount the service account token"
+      expression: >-
+        variables.untrusted.all(c, !has(c.volumeMounts) || c.volumeMounts.all(m, m.name != "relay-token"))
+    - message: "ephemeral containers are not allowed in relay pods"
+      expression: "!has(object.spec.ephemeralContainers) || size(object.spec.ephemeralContainers) == 0"
+    - message: "user containers must not be privileged, gain privileges or add capabilities"
+      expression: >-
+        variables.untrusted.all(c, has(c.securityContext) &&
+          has(c.securityContext.allowPrivilegeEscalation) && !c.securityContext.allowPrivilegeEscalation &&
+          !(has(c.securityContext.privileged) && c.securityContext.privileged) &&
+          !(has(c.securityContext.capabilities) && has(c.securityContext.capabilities.add) &&
+            size(c.securityContext.capabilities.add) > 0))
+    - message: "user containers must run as a non-root uid"
+      expression: >-
+        variables.untrusted.all(c,
+          has(c.securityContext) && has(c.securityContext.runAsNonRoot) && c.securityContext.runAsNonRoot &&
+          (has(c.securityContext.runAsUser) ? c.securityContext.runAsUser : variables.podUid) > 0)
+---
+# Whoever can create pods in the namespace, labelled or not, must not be able to reach the node:
+# from there, every sidecar's credentials on it are readable. This overlaps with Pod Security on
+# purpose, so that neither one alone decides.
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: adbc-relay-namespace-hardening
+spec:
+  failurePolicy: Fail
+  validationActions: [Deny]
+  autogen:
+    podControllers:
+      controllers: []
+    # Enforce natively in the API server. Kyverno deletes its webhooks when scaled to zero, and with
+    # them anything that only a webhook was enforcing.
+    validatingAdmissionPolicy:
+      enabled: true
+  matchConstraints:
+    namespaceSelector:
+      matchLabels:
+        adbc-relay.io/enabled: "true"
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods", "pods/ephemeralcontainers"]
+  variables:
+    - name: all
+      expression: >-
+        object.spec.containers
+        + (has(object.spec.initContainers) ? object.spec.initContainers : [])
+        + (has(object.spec.ephemeralContainers) ? object.spec.ephemeralContainers : [])
+  validations:
+    - message: "pods in this namespace may not use host namespaces"
+      expression: >-
+        !(has(object.spec.hostNetwork) && object.spec.hostNetwork) &&
+        !(has(object.spec.hostPID) && object.spec.hostPID) &&
+        !(has(object.spec.hostIPC) && object.spec.hostIPC)
+    - message: "pods in this namespace may not use host paths"
+      expression: "!has(object.spec.volumes) || object.spec.volumes.all(v, !has(v.hostPath))"
+    - message: "pods in this namespace may not be privileged or add capabilities"
+      expression: >-
+        variables.all.all(c, !has(c.securityContext) || (
+          !(has(c.securityContext.privileged) && c.securityContext.privileged) &&
+          !(has(c.securityContext.capabilities) && has(c.securityContext.capabilities.add) &&
+            size(c.securityContext.capabilities.add) > 0)))
+    # With Vault, the service account decides what data a pod can read, and the pod creator picks it.
+    - message: "pods in this namespace must use an approved service account"
+      expression: >-
+        !has(object.spec.serviceAccountName) || object.spec.serviceAccountName in ["default"]
+---
+# Pod Security is built into the API server, so it keeps working when Kyverno doesn't.
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: adbc-relay-namespace-pod-security
+spec:
+  failurePolicy: Fail
+  validationActions: [Deny]
+  autogen:
+    podControllers:
+      controllers: []
+    # Enforce natively in the API server. Kyverno deletes its webhooks when scaled to zero, and with
+    # them anything that only a webhook was enforcing.
+    validatingAdmissionPolicy:
+      enabled: true
+  matchConstraints:
+    objectSelector:
+      matchLabels:
+        adbc-relay.io/enabled: "true"
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["namespaces"]
+  validations:
+    - message: "namespaces with adbc-relay enabled must enforce the baseline or restricted Pod Security Standard"
+      expression: >-
+        "pod-security.kubernetes.io/enforce" in object.metadata.labels &&
+        object.metadata.labels["pod-security.kubernetes.io/enforce"] in ["baseline", "restricted"]

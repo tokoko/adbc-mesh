@@ -1,0 +1,23 @@
+# Offline check of the mutation. The CLI has no ServiceAccount admission plugin, so token removal is
+# only exercised against a real API server, by deploy/kind/e2e.sh.
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: adbc-relay-inject
+policies:
+  - ../inject-postgres.yaml
+resources:
+  - pod.yaml
+  - pod-no-init.yaml
+variables: values.yaml
+results:
+  - isMutatingPolicy: true
+    policy: adbc-relay-inject-postgres
+    resources: [consumer]
+    patchedResources: pod.expected.yaml
+    result: pass
+  - isMutatingPolicy: true
+    policy: adbc-relay-inject-postgres
+    resources: [consumer-no-init]
+    patchedResources: pod-no-init.expected.yaml
+    result: pass

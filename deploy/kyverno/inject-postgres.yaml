@@ -1,0 +1,164 @@
+# Turns a pod labelled adbc-relay.io/backend=postgres into a relay pod. To add a backend, copy this
+# policy and change the label value, secret name and socket.
+apiVersion: policies.kyverno.io/v1
+kind: MutatingPolicy
+metadata:
+  name: adbc-relay-inject-postgres
+spec:
+  failurePolicy: Fail
+  # Match pods directly. Rewriting controller templates as well would inject twice.
+  autogen:
+    podControllers:
+      controllers: []
+  matchConstraints:
+    namespaceSelector:
+      matchLabels:
+        adbc-relay.io/enabled: "true"
+    objectSelector:
+      matchLabels:
+        adbc-relay.io/backend: postgres
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+  variables:
+    - name: userInit
+      expression: "has(object.spec.initContainers) ? object.spec.initContainers : []"
+    - name: podUid
+      expression: >-
+        has(object.spec.securityContext) && has(object.spec.securityContext.runAsUser)
+        ? object.spec.securityContext.runAsUser : 0
+    - name: isKubeToken
+      expression: >-
+        (has(object.spec.volumes) ? object.spec.volumes : []).filter(v, v.name.startsWith("kube-api-access-")
+          && has(v.projected) && v.projected.sources.exists(s, has(s.serviceAccountToken))).map(v, v.name)
+    - name: sidecar
+      expression: >-
+        Object.spec.initContainers{
+            name: "relay-sidecar",
+            image: "relay-sidecar:dev",
+            imagePullPolicy: "IfNotPresent",
+            restartPolicy: "Always",
+            args: ["/etc/adbc-relay/config.json"],
+            securityContext: Object.spec.initContainers.securityContext{
+              runAsUser: 1337,
+              runAsGroup: 1337,
+              runAsNonRoot: true,
+              allowPrivilegeEscalation: false,
+              readOnlyRootFilesystem: true,
+              capabilities: Object.spec.initContainers.securityContext.capabilities{drop: ["ALL"]},
+              seccompProfile: Object.spec.initContainers.securityContext.seccompProfile{type: "RuntimeDefault"}
+            },
+            resources: Object.spec.initContainers.resources{
+              requests: {"cpu": "100m", "memory": "128Mi"},
+              limits: {"memory": "1Gi"}
+            },
+            startupProbe: Object.spec.initContainers.startupProbe{
+              exec: Object.spec.initContainers.startupProbe.exec{command: ["test", "-S", "/run/adbc-relay/postgres.sock"]},
+              periodSeconds: 1,
+              failureThreshold: 60
+            },
+            volumeMounts: [
+              Object.spec.initContainers.volumeMounts{name: "relay-socket", mountPath: "/run/adbc-relay"},
+              Object.spec.initContainers.volumeMounts{name: "relay-secret", mountPath: "/etc/adbc-relay", readOnly: true},
+          Object.spec.initContainers.volumeMounts{name: "relay-token", mountPath: "/var/run/secrets/adbc-relay", readOnly: true}
+            ]
+          }
+    # Lets the sidecar prove the pod's service account to Vault. The audience keeps it from being
+    # accepted anywhere else. This goes through JSONPatch because ApplyConfiguration can't set the
+    # atomic sources list, and a user volume with this name fails as a duplicate.
+    - name: tokenVolume
+      expression: >-
+        Object.spec.volumes{
+          name: "relay-token",
+          projected: Object.spec.volumes.projected{
+            sources: [Object.spec.volumes.projected.sources{
+              serviceAccountToken: Object.spec.volumes.projected.sources.serviceAccountToken{
+                path: "token", audience: "vault", expirationSeconds: 3600
+              }
+            }]
+          }
+        }
+  mutations:
+    # The ServiceAccount admission plugin runs before webhooks, so by now the token volume is already
+    # in the pod and automountServiceAccountToken: false below can't undo it. Remove it by hand.
+    - patchType: JSONPatch
+      jsonPatch:
+        expression: >-
+          (has(object.spec.volumes) ? [JSONPatch{op: "replace", path: "/spec/volumes",
+            value: object.spec.volumes.filter(v, !(v.name in variables.isKubeToken))}] : [])
+          + lists.range(size(object.spec.containers)).filter(i, has(object.spec.containers[i].volumeMounts)).map(i,
+              JSONPatch{op: "replace", path: "/spec/containers/" + string(i) + "/volumeMounts",
+                value: object.spec.containers[i].volumeMounts.filter(m, !(m.name in variables.isKubeToken))})
+          + lists.range(size(variables.userInit)).filter(i, has(variables.userInit[i].volumeMounts)).map(i,
+              JSONPatch{op: "replace", path: "/spec/initContainers/" + string(i) + "/volumeMounts",
+                value: variables.userInit[i].volumeMounts.filter(m, !(m.name in variables.isKubeToken))})
+    # Lock down the user's containers. The sidecar holds credentials, so make container escapes harder.
+    # Images that default to root get a uid here rather than failing runAsNonRoot at startup.
+    - patchType: ApplyConfiguration
+      applyConfiguration:
+        expression: >-
+          Object{
+            spec: Object.spec{
+              automountServiceAccountToken: false,
+              enableServiceLinks: false,
+              volumes: [
+                Object.spec.volumes{
+                  name: "relay-socket",
+                  emptyDir: Object.spec.volumes.emptyDir{medium: "Memory", sizeLimit: "1Mi"}
+                },
+                Object.spec.volumes{
+                  name: "relay-secret",
+                  secret: Object.spec.volumes.secret{secretName: "adbc-relay-postgres", defaultMode: 292}
+                }
+              ],
+              containers: object.spec.containers.map(c, Object.spec.containers{
+                name: c.name,
+                securityContext: Object.spec.containers.securityContext{
+                  runAsNonRoot: true,
+                  ?runAsUser: (has(c.securityContext) && has(c.securityContext.runAsUser)) || variables.podUid != 0
+                    ? optional.none() : optional.of(1000),
+                  allowPrivilegeEscalation: false,
+                  privileged: false
+                },
+                volumeMounts: [Object.spec.containers.volumeMounts{name: "relay-socket", mountPath: "/run/adbc-relay"}]
+              }),
+              initContainers: variables.userInit.map(c, Object.spec.initContainers{
+                name: c.name,
+                securityContext: Object.spec.initContainers.securityContext{
+                  runAsNonRoot: true,
+                  ?runAsUser: (has(c.securityContext) && has(c.securityContext.runAsUser)) || variables.podUid != 0
+                    ? optional.none() : optional.of(1000),
+                  allowPrivilegeEscalation: false,
+                  privileged: false
+                },
+                volumeMounts: [Object.spec.initContainers.volumeMounts{name: "relay-socket", mountPath: "/run/adbc-relay"}]
+              })
+            }
+          }
+    # Kyverno 1.19.2 has no direct way to create the list with these containers in it: ApplyConfiguration
+    # refuses atomic fields like args, and a JSONPatch value that is a list of objects panics. So create
+    # the list with a bare placeholder, for the next patch to replace.
+    - patchType: ApplyConfiguration
+      applyConfiguration:
+        expression: >-
+          has(object.spec.initContainers) && size(object.spec.initContainers) > 0
+          ? Object{}
+          : Object{spec: Object.spec{initContainers: [
+              Object.spec.initContainers{name: "relay-placeholder", image: "relay-sidecar:dev"}
+            ]}}
+    # Prepend so the user's init containers can use the relay too. A user container with this name
+    # makes the API server reject the pod as a duplicate.
+    - patchType: JSONPatch
+      jsonPatch:
+        expression: >-
+          object.spec.initContainers[0].name == "relay-placeholder"
+          ? [
+              JSONPatch{op: "add", path: "/spec/volumes/-", value: variables.tokenVolume},
+              JSONPatch{op: "replace", path: "/spec/initContainers/0", value: variables.sidecar}
+            ]
+          : [
+              JSONPatch{op: "add", path: "/spec/volumes/-", value: variables.tokenVolume},
+              JSONPatch{op: "add", path: "/spec/initContainers/0", value: variables.sidecar}
+            ]

@@ -1,0 +1,14 @@
+[package]
+name = "relay-proto"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arrow-array.workspace = true
+arrow-buffer.workspace = true
+arrow-data.workspace = true
+arrow-ipc.workspace = true
+arrow-schema.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true

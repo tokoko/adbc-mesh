@@ -1,0 +1,22 @@
+[workspace]
+name = "adbc-relay"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+rust = ">=1.85"
+c-compiler = "*"
+kubernetes-kind = "*"
+kubernetes-client = "*"
+kubernetes-helm = "*"
+kyverno-cli = "*"
+
+[tasks]
+build = "cargo build --release"
+test = "cargo test --release"
+podsim = { cmd = "test/podsim/run.sh", depends-on = ["build"] }
+policy-test = "kyverno test deploy/kyverno/tests"
+kind-up = { cmd = "deploy/kind/up.sh", depends-on = ["build"] }
+kind-e2e = "deploy/kind/e2e.sh"
+kind-outage = "deploy/kind/outage.sh"
+kind-down = "kind delete cluster --name adbc-relay --kubeconfig deploy/kind/kubeconfig"

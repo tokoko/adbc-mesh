@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: consumer
+  namespace: relay-test
+  labels:
+    adbc-relay.io/backend: postgres
+spec:
+  initContainers:
+    - name: user-init
+      image: busybox
+  containers:
+    - name: app
+      image: python:3.12-slim
+      volumeMounts:
+        - {name: scratch, mountPath: /scratch}
+    - name: other
+      image: busybox
+      securityContext:
+        runAsUser: 2000
+  volumes:
+    - name: scratch
+      emptyDir: {}

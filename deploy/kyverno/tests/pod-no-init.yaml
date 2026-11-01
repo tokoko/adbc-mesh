@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: consumer-no-init
+  namespace: relay-test
+  labels:
+    adbc-relay.io/backend: postgres
+spec:
+  containers:
+    - name: app
+      image: python:3.12-slim
