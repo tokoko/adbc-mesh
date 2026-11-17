@@ -4,7 +4,7 @@ metadata:
   name: consumer-no-init
   namespace: relay-test
   labels:
-    adbc-relay.io/backend: postgres
+    adbc-mesh.io/backend: postgres
 spec:
   containers:
     - name: app

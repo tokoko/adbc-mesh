@@ -35,7 +35,7 @@ impl Arena {
     fn new(len: usize) -> Result<Self> {
         let raw = unsafe {
             libc::memfd_create(
-                c"adbc-relay".as_ptr(),
+                c"adbc-mesh".as_ptr(),
                 libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
             )
         };

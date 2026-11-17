@@ -1,0 +1,7 @@
+# The Spark image's uid 185 has a passwd entry, which Hadoop needs. Without this the relay policy
+# would pick uid 1000.
+apiVersion: v1
+kind: Pod
+spec:
+  securityContext:
+    runAsUser: 185

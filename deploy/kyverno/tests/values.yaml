@@ -3,4 +3,4 @@ kind: Values
 namespaceSelector:
   - name: relay-test
     labels:
-      adbc-relay.io/enabled: "true"
+      adbc-mesh.io/enabled: "true"

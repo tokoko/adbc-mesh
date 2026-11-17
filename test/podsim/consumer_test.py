@@ -3,7 +3,7 @@ import array, fcntl, glob, json, mmap, os, socket, sys
 import adbc_driver_manager.dbapi as dbapi
 import pyarrow as pa
 
-SOCK = os.environ.get("RELAY_SOCK", "/run/adbc-relay/relay.sock")
+SOCK = os.environ.get("RELAY_SOCK", "/run/adbc-mesh/relay.sock")
 LOWCAP_SOCK = os.environ.get("RELAY_LOWCAP_SOCK")
 DRIVER = "/opt/relay/libadbc_driver_relay.so"
 HIDDEN = (b"SECRET-SSN", b"SECRET-TOKEN", b"s3cr3t-pg-password")
@@ -49,7 +49,7 @@ print("\n-- zero copy, as seen from the consumer's address space")
 raw = query("SELECT id, name, dept FROM public.employees")
 regions = []
 for line in open("/proc/self/maps"):
-    if "memfd:adbc-relay" in line:
+    if "memfd:adbc-mesh" in line:
         lo, hi = (int(x, 16) for x in line.split()[0].split("-"))
         regions.append((lo, hi, line.split()[1]))
 addrs = [b.address for col in raw.columns for chunk in col.chunks for b in chunk.buffers() if b is not None and b.size]
@@ -182,7 +182,7 @@ for path in glob.glob("/proc/[0-9]*/environ") + glob.glob("/proc/[0-9]*/cmdline"
         pass
 check("no credential in any visible process's env or cmdline", not leaks, leaks)
 check("no sidecar process visible", not any("relay-sidecar" in open(p, "rb").read().decode(errors="ignore") for p in glob.glob("/proc/[0-9]*/cmdline") if os.access(p, os.R_OK)))
-check("sidecar config not mounted here", not os.path.exists("/etc/adbc-relay"))
+check("sidecar config not mounted here", not os.path.exists("/etc/adbc-mesh"))
 if os.environ.get("EXPECT_ISOLATED"):
     print("\n-- pod isolation")
     check("no service account token", not os.path.exists("/var/run/secrets/kubernetes.io"))

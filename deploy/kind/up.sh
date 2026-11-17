@@ -3,7 +3,7 @@
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd); root=$(cd "$here/../.." && pwd)
 export KUBECONFIG=$here/kubeconfig
-CLUSTER=adbc-relay
+CLUSTER=adbc-mesh
 PG_DRIVER=${PG_DRIVER:-$HOME/.config/adbc/drivers/postgresql_linux_amd64_v1.12.0/libadbc_driver_postgresql.so}
 
 kind get clusters | grep -qx $CLUSTER || kind create cluster --config "$here/cluster.yaml" --kubeconfig "$KUBECONFIG" --wait 120s
@@ -18,9 +18,14 @@ kind load docker-image --name $CLUSTER relay-sidecar:dev relay-consumer:dev >/de
 
 helm repo add kyverno https://kyverno.github.io/kyverno/ >/dev/null 2>&1 || true
 helm upgrade --install kyverno kyverno/kyverno --version 3.9.2 -n kyverno --create-namespace --wait --timeout 5m >/dev/null
-kubectl apply -f "$root/deploy/kyverno/inject-postgres.yaml" -f "$root/deploy/kyverno/validate.yaml"
+# helm --wait returns once the pods are ready, which can be before the webhook service answers.
+for i in $(seq 60); do
+  kubectl apply -f "$root/deploy/kyverno/inject-postgres.yaml" -f "$root/deploy/kyverno/validate.yaml" && break
+  [ "$i" = 60 ] && exit 1; sleep 2
+done
 
 kubectl apply -f "$here/backend.yaml"
 kubectl -n relay-backend create configmap pg-seed --from-file=seed.sql="$root/test/podsim/seed.sql" --dry-run=client -o yaml | kubectl apply -f -
 kubectl -n relay-backend rollout status deployment/pg --timeout=300s
 kubectl apply -f "$here/relay-test.yaml"
+kubectl apply -f "$here/spark/tenant.yaml"

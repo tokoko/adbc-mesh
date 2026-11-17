@@ -19,11 +19,11 @@ use relay_proto::socket::Conn;
 use relay_proto::{batch, ErrorKind, Request, Response};
 
 fn unsupported(what: &str) -> Error {
-    Error::with_message_and_status(format!("adbc-relay: {what} is not supported"), Status::NotImplemented)
+    Error::with_message_and_status(format!("adbc-mesh: {what} is not supported"), Status::NotImplemented)
 }
 
 fn io(error: std::io::Error) -> Error {
-    Error::with_message_and_status(format!("adbc-relay: {error}"), Status::IO)
+    Error::with_message_and_status(format!("adbc-mesh: {error}"), Status::IO)
 }
 
 fn remote(kind: ErrorKind, message: String) -> Error {
@@ -32,11 +32,11 @@ fn remote(kind: ErrorKind, message: String) -> Error {
         ErrorKind::Exhausted => Status::Internal,
         ErrorKind::Backend => Status::IO,
     };
-    Error::with_message_and_status(format!("adbc-relay: {message}"), status)
+    Error::with_message_and_status(format!("adbc-mesh: {message}"), status)
 }
 
 fn protocol(what: &str) -> Error {
-    Error::with_message_and_status(format!("adbc-relay: protocol error: {what}"), Status::Internal)
+    Error::with_message_and_status(format!("adbc-mesh: protocol error: {what}"), Status::Internal)
 }
 
 macro_rules! no_options {
@@ -93,7 +93,7 @@ impl Optionable for RelayDatabase {
                 Ok(())
             }
             (key, _) => Err(Error::with_message_and_status(
-                format!("adbc-relay: option '{}' is refused; backend settings belong to the sidecar", key.as_ref()),
+                format!("adbc-mesh: option '{}' is refused; backend settings belong to the sidecar", key.as_ref()),
                 Status::InvalidArguments,
             )),
         }
@@ -107,7 +107,7 @@ impl Database for RelayDatabase {
 
     fn new_connection(&self) -> Result<RelayConnection> {
         let socket = self.socket.clone().ok_or_else(|| {
-            Error::with_message_and_status("adbc-relay: 'uri' must name the sidecar socket", Status::InvalidState)
+            Error::with_message_and_status("adbc-mesh: 'uri' must name the sidecar socket", Status::InvalidState)
         })?;
         // Fail at connect time if the sidecar isn't there, rather than on the first query.
         Conn::connect(&socket).map_err(io)?;
@@ -230,7 +230,7 @@ pub struct RelayStatement {
 impl RelayStatement {
     fn open_stream(&self) -> Result<RelayReader> {
         let sql = self.sql.clone().ok_or_else(|| {
-            Error::with_message_and_status("adbc-relay: no query set", Status::InvalidState)
+            Error::with_message_and_status("adbc-mesh: no query set", Status::InvalidState)
         })?;
         let conn = connect(&self.socket)?;
         conn.send(&Request::Query { sql }, None).map_err(io)?;
@@ -248,7 +248,7 @@ impl Optionable for RelayStatement {
 
     fn set_option(&mut self, key: OptionStatement, _value: OptionValue) -> Result<()> {
         Err(Error::with_message_and_status(
-            format!("adbc-relay: statement option '{}' is refused", key.as_ref()),
+            format!("adbc-mesh: statement option '{}' is refused", key.as_ref()),
             Status::InvalidArguments,
         ))
     }

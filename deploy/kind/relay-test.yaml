@@ -3,20 +3,20 @@ kind: Namespace
 metadata:
   name: relay-test
   labels:
-    adbc-relay.io/enabled: "true"
+    adbc-mesh.io/enabled: "true"
     pod-security.kubernetes.io/enforce: baseline
 ---
 apiVersion: v1
 kind: Secret
 metadata:
-  name: adbc-relay-postgres
+  name: adbc-mesh-postgres
   namespace: relay-test
 stringData:
   uri: postgresql://relay_reader:s3cr3t-pg-password@pg.relay-backend.svc.cluster.local:5432/postgres
   config.json: |
-    {"socket": "/run/adbc-relay/postgres.sock",
+    {"socket": "/run/adbc-mesh/postgres.sock",
      "driver": {"name": "/opt/relay/libadbc_driver_postgresql.so",
-                "options_from_files": {"uri": "/etc/adbc-relay/uri"}},
+                "options_from_files": {"uri": "/etc/adbc-mesh/uri"}},
      "max_outstanding_bytes": 805306368}
 ---
 # Fixture: exists so the e2e test can show that the policy, not a missing account, refuses it.

@@ -2,7 +2,7 @@ apiVersion: v1
 kind: Pod
 metadata:
     labels:
-        adbc-relay.io/backend: postgres
+        adbc-mesh.io/backend: postgres
     name: consumer-no-init
     namespace: relay-test
 spec:
@@ -16,12 +16,12 @@ spec:
             runAsNonRoot: true
             runAsUser: 1000
           volumeMounts:
-            - mountPath: /run/adbc-relay
+            - mountPath: /run/adbc-mesh
               name: relay-socket
     enableServiceLinks: false
     initContainers:
         - args:
-            - /etc/adbc-relay/config.json
+            - /etc/adbc-mesh/config.json
           image: relay-sidecar:dev
           imagePullPolicy: IfNotPresent
           name: relay-sidecar
@@ -48,16 +48,16 @@ spec:
                 command:
                     - test
                     - -S
-                    - /run/adbc-relay/postgres.sock
+                    - /run/adbc-mesh/postgres.sock
             failureThreshold: 60
             periodSeconds: 1
           volumeMounts:
-            - mountPath: /run/adbc-relay
+            - mountPath: /run/adbc-mesh
               name: relay-socket
-            - mountPath: /etc/adbc-relay
+            - mountPath: /etc/adbc-mesh
               name: relay-secret
               readOnly: true
-            - mountPath: /var/run/secrets/adbc-relay
+            - mountPath: /var/run/secrets/adbc-mesh
               name: relay-token
               readOnly: true
     volumes:
@@ -68,7 +68,7 @@ spec:
         - name: relay-secret
           secret:
             defaultMode: 292
-            secretName: adbc-relay-postgres
+            secretName: adbc-mesh-postgres
         - name: relay-token
           projected:
             sources:

@@ -19,14 +19,19 @@ allowed() {
   local out; out=$(kubectl apply --dry-run=server -f - 2>&1)
   if [ $? -eq 0 ]; then pass "$1"; else fail "$1: $(cut -c1-220 <<<"$out")"; fi
 }
+# usage: allowed_without <name> <text> <<< pod-yaml. Refused, or admitted with <text> gone.
+allowed_without() {
+  local out; out=$(kubectl apply --dry-run=server -o yaml -f - 2>&1)
+  if ! grep -qF "$2" <<<"$out" || ! grep -q '^kind: Pod' <<<"$out"; then pass "$1"; else fail "$1: $(cut -c1-220 <<<"$out")"; fi
+}
 pod() { # name, labels-yaml, spec-yaml
   printf 'apiVersion: v1\nkind: Pod\nmetadata:\n  name: %s\n  namespace: %s\n  labels: %s\nspec:\n%s\n' "$1" "$NS" "$2" "$3"
 }
-L='{adbc-relay.io/backend: postgres}'
+L='{adbc-mesh.io/backend: postgres}'
 APP='  containers:
     - {name: app, image: relay-consumer:dev'
 SEC='  volumes:
-    - {name: s, secret: {secretName: adbc-relay-postgres}}'
+    - {name: s, secret: {secretName: adbc-mesh-postgres}}'
 
 echo "-- admission: credentials"
 pod t-unlabelled '{}' "$APP, volumeMounts: [{name: s, mountPath: /s}]}
@@ -36,17 +41,84 @@ $SEC" | refused "consumer mounting the secret" "only relay-sidecar may mount"
 pod t-mount-injected "$L" "$APP, volumeMounts: [{name: relay-secret, mountPath: /s}]}" | refused "consumer mounting the injected volume" "only relay-sidecar may mount"
 pod t-projected "$L" "$APP, volumeMounts: [{name: p, mountPath: /s}]}
   volumes:
-    - {name: p, projected: {sources: [{secret: {name: adbc-relay-postgres}}]}}" | refused "secret through a projected volume" "only relay-sidecar may mount"
-pod t-env '{}' "$APP, env: [{name: X, valueFrom: {secretKeyRef: {name: adbc-relay-postgres, key: uri}}}]}" | refused "secret through env" "environment variables"
-pod t-envfrom '{}' "$APP, envFrom: [{secretRef: {name: adbc-relay-postgres}}]}" | refused "secret through envFrom" "environment variables"
+    - {name: p, projected: {sources: [{secret: {name: adbc-mesh-postgres}}]}}" | refused "secret through a projected volume" "only relay-sidecar may mount"
+pod t-env '{}' "$APP, env: [{name: X, valueFrom: {secretKeyRef: {name: adbc-mesh-postgres, key: uri}}}]}" | refused "secret through env" "environment variables"
+pod t-envfrom '{}' "$APP, envFrom: [{secretRef: {name: adbc-mesh-postgres}}]}" | refused "secret through envFrom" "environment variables"
 
 echo "-- admission: impersonating or dropping the sidecar"
+SIDE='{name: relay-sidecar, image: relay-sidecar:dev, restartPolicy: Always, args: [/etc/adbc-mesh/config.json],
+      securityContext: {runAsUser: 1337, readOnlyRootFilesystem: true, allowPrivilegeEscalation: false},
+      startupProbe: {exec: {command: [test, -S, /run/adbc-mesh/postgres.sock]}},
+      volumeMounts: [{name: relay-socket, mountPath: /run/adbc-mesh}, {name: relay-secret, mountPath: /etc/adbc-mesh}, {name: relay-token, mountPath: /var/run/secrets/adbc-mesh}'
+pod t-spoof-preload "$L" "  initContainers:
+    - ${SIDE}], env: [{name: LD_PRELOAD, value: /run/adbc-mesh/evil.so}]}
+$APP}
+  volumes:
+    - {name: relay-token, projected: {sources: [{serviceAccountToken: {path: token, audience: vault}}]}}" | refused "own sidecar with approved image and LD_PRELOAD" "may not be customised"
+pod t-spoof-mount "$L" "  initContainers:
+    - ${SIDE}, {name: x, mountPath: /x}]}
+$APP}
+  volumes:
+    - {name: x, emptyDir: {}}
+    - {name: relay-token, projected: {sources: [{serviceAccountToken: {path: token, audience: vault}}]}}" | refused "own sidecar with an extra mount" "may not be customised"
+pod t-spoof-secret "$L" "  initContainers:
+    - ${SIDE}]}
+$APP}
+  volumes:
+    - {name: relay-secret, secret: {secretName: attacker-config}}
+    - {name: relay-token, projected: {sources: [{serviceAccountToken: {path: token, audience: vault}}]}}" | allowed_without "own sidecar pointed at the attacker's config" "secretName: attacker-config"
+pod t-spoof-order "$L" "  initContainers:
+    - {name: first, image: evil}
+    - ${SIDE}]}
+$APP}
+  volumes:
+    - {name: relay-token, projected: {sources: [{serviceAccountToken: {path: token, audience: vault}}]}}" | refused "own sidecar placed after user code" "must run first"
+pod t-spoof-copy "$L" "  initContainers:
+    - ${SIDE}]}
+$APP}
+  volumes:
+    - {name: relay-token, projected: {sources: [{serviceAccountToken: {path: token, audience: vault}}]}}" | allowed "exact copy of the sidecar gains nothing and is allowed"
 pod t-dup-sidecar "$L" "$APP}
     - {name: relay-sidecar, image: evil}" | refused "user container named relay-sidecar" "Duplicate value"
 pod t-dup-init "$L" "  initContainers:
     - {name: relay-sidecar, image: evil}
-$APP}" | refused "user init container named relay-sidecar" "Duplicate value"
-pod t-nonsense '{adbc-relay.io/backend: nonsense}' "$APP}" | refused "label with no injection policy" "relay-sidecar must run first"
+$APP}" | refused "user init container named relay-sidecar" "approved image"
+pod t-nonsense '{adbc-mesh.io/backend: nonsense}' "$APP}" | refused "label with no injection policy" "relay-sidecar must run first"
+
+echo "-- admission: Spark driver token"
+sparkpod() { printf 'apiVersion: v1\nkind: Pod\nmetadata:\n  name: %s\n  namespace: relay-spark\n  labels: %s\nspec:\n%s\n' "$1" "$2" "$3"; }
+SPARKAPP='  containers:
+    - {name: app, image: relay-spark:dev'
+out=$(sparkpod t-driver "$L" "  serviceAccountName: spark-driver
+$SPARKAPP}" | kubectl apply --dry-run=server -o json -f - 2>&1)
+python3 -c "
+import sys,re
+s=sys.argv[1]
+import json
+try:
+    d=json.loads(s)
+except Exception:
+    sys.exit(1)
+mounts=lambda c:[m['name'] for m in c.get('volumeMounts',[])]
+side=[c for c in d['spec']['initContainers'] if c['name']=='relay-sidecar']
+app=d['spec']['containers'][0]
+ok=len(side)==1 and any(m.startswith('kube-api-access-') for m in mounts(app)) and not any(m.startswith('kube-api-access-') for m in mounts(side[0]))
+sys.exit(0 if ok else 1)" "$out" && pass "driver keeps its API token in its own container, and the sidecar has none" || fail "driver: $(cut -c1-260 <<<"$out")"
+out=$(sparkpod t-exec "$L" "  serviceAccountName: spark-executor
+$SPARKAPP}" | kubectl apply --dry-run=server -o yaml -f - 2>&1)
+grep -q 'kube-api-access-' <<<"$out" && fail "executor kept a token" || pass "executor has no API token"
+out=$(sparkpod t-drv-aud "$L" "  serviceAccountName: spark-driver
+$SPARKAPP, volumeMounts: [{name: kube-api-access-x, mountPath: /x}]}
+  volumes:
+    - {name: kube-api-access-x, projected: {sources: [{serviceAccountToken: {path: t, audience: vault}}]}}" | kubectl apply --dry-run=server -f - 2>&1)
+[ $? -ne 0 ] && pass "driver minting a vault token under the kube-api-access name" || fail "driver vault token: $out"
+out=$(sparkpod t-label-only '{adbc-mesh.io/backend: postgres, spark-role: driver}' "$SPARKAPP}" | kubectl apply --dry-run=server -o yaml -f - 2>&1)
+grep -q 'kube-api-access-' <<<"$out" && fail "a spark-role=driver label kept the token" || pass "a driver label alone keeps no token"
+AS="--as=system:serviceaccount:relay-spark:spark-driver"
+# "can-i create pods/exec" answers yes for anyone who can create pods. --subresource asks properly.
+for verb in "get secrets" "list secrets" "create pods --subresource=exec" "get pods --subresource=exec" "create pods --subresource=attach" "create pods --subresource=portforward" "create serviceaccounts/token" "create rolebindings" "patch pods" "update pods"; do
+  [ "$(kubectl -n relay-spark auth can-i $verb $AS 2>/dev/null)" = no ] && pass "driver may not: $verb" || fail "driver may: $verb"
+done
 
 echo "-- admission: escaping the sandbox"
 pod t-root "$L" "$APP, securityContext: {runAsUser: 0}}" | refused "consumer as root" "non-root"
@@ -91,8 +163,8 @@ pod t-sa "$L" "  serviceAccountName: some-powerful-account
 $APP}" | refused "unapproved service account on a relay pod" "approved service account"
 
 echo "-- admission: Pod Security stays on"
-printf 'apiVersion: v1\nkind: Namespace\nmetadata:\n  name: t-no-pss\n  labels: {adbc-relay.io/enabled: "true"}\n' | refused "enabling a namespace without Pod Security" "must enforce the baseline"
-printf 'apiVersion: v1\nkind: Namespace\nmetadata:\n  name: t-weak-pss\n  labels: {adbc-relay.io/enabled: "true", pod-security.kubernetes.io/enforce: privileged}\n' | refused "enabling a namespace with privileged Pod Security" "must enforce the baseline"
+printf 'apiVersion: v1\nkind: Namespace\nmetadata:\n  name: t-no-pss\n  labels: {adbc-mesh.io/enabled: "true"}\n' | refused "enabling a namespace without Pod Security" "must enforce the baseline"
+printf 'apiVersion: v1\nkind: Namespace\nmetadata:\n  name: t-weak-pss\n  labels: {adbc-mesh.io/enabled: "true", pod-security.kubernetes.io/enforce: privileged}\n' | refused "enabling a namespace with privileged Pod Security" "must enforce the baseline"
 out=$(kubectl label namespace $NS pod-security.kubernetes.io/enforce- --dry-run=server 2>&1)
 [ $? -ne 0 ] && grep -qF "must enforce the baseline" <<<"$out" && pass "removing Pod Security from an enabled namespace" || fail "removing Pod Security: $(cut -c1-200 <<<"$out")"
 
@@ -134,8 +206,8 @@ order=$(kubectl -n $NS get pod "$pod_name" -o jsonpath='{.spec.initContainers[*]
 patch=$(printf '{"spec":{"initContainers":[{"name":"relay-sidecar","image":"evil"}]}}')
 out=$(kubectl -n $NS patch pod "$pod_name" --dry-run=server -p "$patch" 2>&1)
 [ $? -ne 0 ] && grep -qF "approved image" <<<"$out" && pass "swapping the sidecar image on a live pod" || fail "image swap: $(cut -c1-200 <<<"$out")"
-out=$(kubectl -n $NS patch pod "$pod_name" --dry-run=server --type=json -p '[{"op":"remove","path":"/metadata/labels/adbc-relay.io~1backend"}]' 2>&1)
-[ $? -ne 0 ] && grep -qE "only an injected relay pod|keep the adbc-relay.io/backend label" <<<"$out" && pass "removing the label on a live pod" || fail "label removal: $(cut -c1-200 <<<"$out")"
+out=$(kubectl -n $NS patch pod "$pod_name" --dry-run=server --type=json -p '[{"op":"remove","path":"/metadata/labels/adbc-mesh.io~1backend"}]' 2>&1)
+[ $? -ne 0 ] && grep -qE "only an injected relay pod|keep the adbc-mesh.io/backend label" <<<"$out" && pass "removing the label on a live pod" || fail "label removal: $(cut -c1-200 <<<"$out")"
 # The default debug profile adds SYS_PTRACE, so Pod Security answers first. The baseline profile adds
 # nothing, so it reaches our own rule.
 out=$(kubectl -n $NS debug "$pod_name" --image=busybox --target=app -- true 2>&1)
@@ -149,7 +221,7 @@ kubectl -n $NS delete pod token-probe --ignore-not-found --wait=true >/dev/null
 pod token-probe "$L" "  terminationGracePeriodSeconds: 1
 $APP, command: [sleep, '600']}" | kubectl apply -f - >/dev/null
 kubectl -n $NS wait --for=condition=Ready pod/token-probe --timeout=120s >/dev/null
-TOKEN_PATH=/var/run/secrets/adbc-relay/token
+TOKEN_PATH=/var/run/secrets/adbc-mesh/token
 if jwt=$(kubectl -n $NS exec token-probe -c relay-sidecar -- cat $TOKEN_PATH 2>/dev/null) && [ -n "$jwt" ]; then pass "sidecar can read the token"; else fail "sidecar cannot read the token: $(kubectl -n $NS exec token-probe -c relay-sidecar -- ls -lL $TOKEN_PATH 2>&1 | cut -c1-120)"; fi
 kubectl -n $NS exec token-probe -c app -- sh -c "! test -e $TOKEN_PATH && ! test -e /var/run/secrets/kubernetes.io" && pass "consumer has no token at all" || fail "consumer can see a token"
 kubectl -n $NS exec token-probe -c relay-sidecar -- sh -c "! test -e /var/run/secrets/kubernetes.io" && pass "sidecar has no default API token" || fail "sidecar has the default API token"

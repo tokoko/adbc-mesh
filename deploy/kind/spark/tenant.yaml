@@ -1,0 +1,78 @@
+# One namespace per tenant: a driver can list and delete any pod here, read any ConfigMap, and mount
+# any Secret that isn't adbc-mesh-*.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: relay-spark
+  labels:
+    adbc-mesh.io/enabled: "true"
+    pod-security.kubernetes.io/enforce: baseline
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: adbc-mesh-postgres
+  namespace: relay-spark
+stringData:
+  uri: postgresql://relay_reader:s3cr3t-pg-password@pg.relay-backend.svc.cluster.local:5432/postgres
+  config.json: |
+    {"socket": "/run/adbc-mesh/postgres.sock",
+     "driver": {"name": "/opt/relay/libadbc_driver_postgresql.so",
+                "options_from_files": {"uri": "/etc/adbc-mesh/uri"}},
+     "max_outstanding_bytes": 805306368}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spark-driver
+  namespace: relay-spark
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spark-executor
+  namespace: relay-spark
+automountServiceAccountToken: false
+---
+# Fixture: exists so the test can show that the policy, not a missing account, refuses it.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: some-powerful-account
+  namespace: relay-spark
+---
+# Deliberately not the edit ClusterRole from Spark's docs, which includes secrets and pods/exec.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: spark-driver
+  namespace: relay-spark
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [create, get, list, watch, delete, deletecollection]
+  - apiGroups: [""]
+    resources: [services, configmaps]
+    verbs: [create, get, list, watch, delete, deletecollection]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: spark-driver
+  namespace: relay-spark
+subjects:
+  - {kind: ServiceAccount, name: spark-driver, namespace: relay-spark}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: spark-driver
+---
+# User code decides how many pods get created.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: spark
+  namespace: relay-spark
+spec:
+  hard:
+    pods: "20"

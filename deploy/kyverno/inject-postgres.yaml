@@ -1,9 +1,9 @@
-# Turns a pod labelled adbc-relay.io/backend=postgres into a relay pod. To add a backend, copy this
+# Turns a pod labelled adbc-mesh.io/backend=postgres into a relay pod. To add a backend, copy this
 # policy and change the label value, secret name and socket.
 apiVersion: policies.kyverno.io/v1
 kind: MutatingPolicy
 metadata:
-  name: adbc-relay-inject-postgres
+  name: adbc-mesh-inject-postgres
 spec:
   failurePolicy: Fail
   # Match pods directly. Rewriting controller templates as well would inject twice.
@@ -13,10 +13,10 @@ spec:
   matchConstraints:
     namespaceSelector:
       matchLabels:
-        adbc-relay.io/enabled: "true"
+        adbc-mesh.io/enabled: "true"
     objectSelector:
       matchLabels:
-        adbc-relay.io/backend: postgres
+        adbc-mesh.io/backend: postgres
     resourceRules:
       - apiGroups: [""]
         apiVersions: ["v1"]
@@ -29,8 +29,14 @@ spec:
       expression: >-
         has(object.spec.securityContext) && has(object.spec.securityContext.runAsUser)
         ? object.spec.securityContext.runAsUser : 0
+    # The Spark driver has to call the API server to create its executors. The service account decides
+    # rather than a label, because RBAC follows the account and anyone can set a label.
+    - name: keepsApiToken
+      expression: >-
+        has(object.spec.serviceAccountName) && object.spec.serviceAccountName == "spark-driver"
     - name: isKubeToken
       expression: >-
+        variables.keepsApiToken ? [] :
         (has(object.spec.volumes) ? object.spec.volumes : []).filter(v, v.name.startsWith("kube-api-access-")
           && has(v.projected) && v.projected.sources.exists(s, has(s.serviceAccountToken))).map(v, v.name)
     - name: sidecar
@@ -40,7 +46,7 @@ spec:
             image: "relay-sidecar:dev",
             imagePullPolicy: "IfNotPresent",
             restartPolicy: "Always",
-            args: ["/etc/adbc-relay/config.json"],
+            args: ["/etc/adbc-mesh/config.json"],
             securityContext: Object.spec.initContainers.securityContext{
               runAsUser: 1337,
               runAsGroup: 1337,
@@ -55,14 +61,14 @@ spec:
               limits: {"memory": "1Gi"}
             },
             startupProbe: Object.spec.initContainers.startupProbe{
-              exec: Object.spec.initContainers.startupProbe.exec{command: ["test", "-S", "/run/adbc-relay/postgres.sock"]},
+              exec: Object.spec.initContainers.startupProbe.exec{command: ["test", "-S", "/run/adbc-mesh/postgres.sock"]},
               periodSeconds: 1,
               failureThreshold: 60
             },
             volumeMounts: [
-              Object.spec.initContainers.volumeMounts{name: "relay-socket", mountPath: "/run/adbc-relay"},
-              Object.spec.initContainers.volumeMounts{name: "relay-secret", mountPath: "/etc/adbc-relay", readOnly: true},
-          Object.spec.initContainers.volumeMounts{name: "relay-token", mountPath: "/var/run/secrets/adbc-relay", readOnly: true}
+              Object.spec.initContainers.volumeMounts{name: "relay-socket", mountPath: "/run/adbc-mesh"},
+              Object.spec.initContainers.volumeMounts{name: "relay-secret", mountPath: "/etc/adbc-mesh", readOnly: true},
+          Object.spec.initContainers.volumeMounts{name: "relay-token", mountPath: "/var/run/secrets/adbc-mesh", readOnly: true}
             ]
           }
     # Lets the sidecar prove the pod's service account to Vault. The audience keeps it from being
@@ -101,7 +107,7 @@ spec:
         expression: >-
           Object{
             spec: Object.spec{
-              automountServiceAccountToken: false,
+              ?automountServiceAccountToken: variables.keepsApiToken ? optional.none() : optional.of(false),
               enableServiceLinks: false,
               volumes: [
                 Object.spec.volumes{
@@ -110,7 +116,7 @@ spec:
                 },
                 Object.spec.volumes{
                   name: "relay-secret",
-                  secret: Object.spec.volumes.secret{secretName: "adbc-relay-postgres", defaultMode: 292}
+                  secret: Object.spec.volumes.secret{secretName: "adbc-mesh-postgres", defaultMode: 292}
                 }
               ],
               containers: object.spec.containers.map(c, Object.spec.containers{
@@ -122,7 +128,7 @@ spec:
                   allowPrivilegeEscalation: false,
                   privileged: false
                 },
-                volumeMounts: [Object.spec.containers.volumeMounts{name: "relay-socket", mountPath: "/run/adbc-relay"}]
+                volumeMounts: [Object.spec.containers.volumeMounts{name: "relay-socket", mountPath: "/run/adbc-mesh"}]
               }),
               initContainers: variables.userInit.map(c, Object.spec.initContainers{
                 name: c.name,
@@ -133,7 +139,7 @@ spec:
                   allowPrivilegeEscalation: false,
                   privileged: false
                 },
-                volumeMounts: [Object.spec.initContainers.volumeMounts{name: "relay-socket", mountPath: "/run/adbc-relay"}]
+                volumeMounts: [Object.spec.initContainers.volumeMounts{name: "relay-socket", mountPath: "/run/adbc-mesh"}]
               })
             }
           }
@@ -148,11 +154,22 @@ spec:
           : Object{spec: Object.spec{initContainers: [
               Object.spec.initContainers{name: "relay-placeholder", image: "relay-sidecar:dev"}
             ]}}
-    # Prepend so the user's init containers can use the relay too. A user container with this name
-    # makes the API server reject the pod as a duplicate.
+    # Prepend so the user's init containers can use the relay too.
+    #
+    # This runs twice for pods that keep their API token: the ServiceAccount admission plugin runs
+    # again after this webhook, mounts the token into every container including the new sidecar, and
+    # that change makes the API server invoke this webhook a second time. So the second pass takes the
+    # token back out of the sidecar and must not inject again. Skipping is what makes a user's own
+    # relay-sidecar possible, which is why adbc-mesh-pod-shape pins the sidecar and its volumes.
     - patchType: JSONPatch
       jsonPatch:
         expression: >-
+          object.spec.initContainers.exists(c, c.name == "relay-sidecar")
+          ? lists.range(size(object.spec.initContainers))
+              .filter(i, object.spec.initContainers[i].name == "relay-sidecar" && has(object.spec.initContainers[i].volumeMounts))
+              .map(i, JSONPatch{op: "replace", path: "/spec/initContainers/" + string(i) + "/volumeMounts",
+                value: object.spec.initContainers[i].volumeMounts.filter(m, !m.name.startsWith("kube-api-access-"))})
+          :
           object.spec.initContainers[0].name == "relay-placeholder"
           ? [
               JSONPatch{op: "add", path: "/spec/volumes/-", value: variables.tokenVolume},

@@ -3,7 +3,7 @@
 apiVersion: cli.kyverno.io/v1alpha1
 kind: Test
 metadata:
-  name: adbc-relay-inject
+  name: adbc-mesh-inject
 policies:
   - ../inject-postgres.yaml
 resources:
@@ -12,12 +12,12 @@ resources:
 variables: values.yaml
 results:
   - isMutatingPolicy: true
-    policy: adbc-relay-inject-postgres
+    policy: adbc-mesh-inject-postgres
     resources: [consumer]
     patchedResources: pod.expected.yaml
     result: pass
   - isMutatingPolicy: true
-    policy: adbc-relay-inject-postgres
+    policy: adbc-mesh-inject-postgres
     resources: [consumer-no-init]
     patchedResources: pod-no-init.expected.yaml
     result: pass

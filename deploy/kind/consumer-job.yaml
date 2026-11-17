@@ -9,7 +9,7 @@ spec:
   template:
     metadata:
       labels:
-        adbc-relay.io/backend: postgres
+        adbc-mesh.io/backend: postgres
     spec:
       restartPolicy: Never
       containers:
@@ -18,6 +18,6 @@ spec:
           imagePullPolicy: IfNotPresent
           command: [python, /test/consumer_test.py]
           env:
-            - {name: RELAY_SOCK, value: /run/adbc-relay/postgres.sock}
+            - {name: RELAY_SOCK, value: /run/adbc-mesh/postgres.sock}
             - {name: BACKEND_HOST, value: pg.relay-backend.svc.cluster.local}
             - {name: EXPECT_ISOLATED, value: "1"}

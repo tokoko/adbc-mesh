@@ -11,7 +11,7 @@ restore() { kubectl -n kyverno scale $DEPLOY --replicas=1 >/dev/null; kubectl -n
 trap restore EXIT
 webhooks() { kubectl get validatingwebhookconfigurations,mutatingwebhookconfigurations -o name | grep -c kyverno-resource; }
 
-labelled='{name: down-relay, namespace: '$NS', labels: {adbc-relay.io/backend: postgres}}'
+labelled='{name: down-relay, namespace: '$NS', labels: {adbc-mesh.io/backend: postgres}}'
 check() { # name, expected message, metadata, spec
   local out; out=$(printf 'apiVersion: v1\nkind: Pod\nmetadata: %s\nspec:\n%s\n' "$3" "$4" | kubectl apply --dry-run=server -f - 2>&1)
   if [ $? -ne 0 ] && grep -qE "$2" <<<"$out"; then pass "$1"; else fail "$1: $(cut -c1-200 <<<"$out")"; fi
@@ -19,13 +19,13 @@ check() { # name, expected message, metadata, spec
 attacks() {
   check "credentials in an unlabelled pod" "only an injected relay pod|failed calling webhook" "{name: down-a, namespace: $NS}" \
     "  containers: [{name: app, image: relay-consumer:dev, volumeMounts: [{name: s, mountPath: /s}]}]
-  volumes: [{name: s, secret: {secretName: adbc-relay-postgres}}]"
+  volumes: [{name: s, secret: {secretName: adbc-mesh-postgres}}]"
   check "relay pod that was never injected" "relay-sidecar must run first|failed calling webhook" "$labelled" \
     "  containers: [{name: app, image: relay-consumer:dev}]"
   check "pod carrying its own fake sidecar" "only an injected relay pod|failed calling webhook" "{name: down-c, namespace: $NS}" \
     "  initContainers: [{name: relay-sidecar, image: relay-sidecar:dev, command: [sh], volumeMounts: [{name: s, mountPath: /s}]}]
   containers: [{name: app, image: relay-consumer:dev}]
-  volumes: [{name: s, secret: {secretName: adbc-relay-postgres}}]"
+  volumes: [{name: s, secret: {secretName: adbc-mesh-postgres}}]"
   check "minted vault-audience token" "vault audience|failed calling webhook" "{name: down-d, namespace: $NS}" \
     "  containers: [{name: app, image: relay-consumer:dev}]
   volumes: [{name: t, projected: {sources: [{serviceAccountToken: {path: token, audience: vault}}]}}]"

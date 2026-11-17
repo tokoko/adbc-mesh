@@ -1,4 +1,4 @@
-# Test backend, deliberately in a namespace without the adbc-relay.io/enabled label.
+# Test backend, deliberately in a namespace without the adbc-mesh.io/enabled label.
 apiVersion: v1
 kind: Namespace
 metadata:

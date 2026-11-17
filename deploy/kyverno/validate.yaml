@@ -2,7 +2,7 @@
 apiVersion: policies.kyverno.io/v1
 kind: ValidatingPolicy
 metadata:
-  name: adbc-relay-credentials
+  name: adbc-mesh-credentials
 spec:
   failurePolicy: Fail
   validationActions: [Deny]
@@ -18,7 +18,7 @@ spec:
   matchConstraints:
     namespaceSelector:
       matchLabels:
-        adbc-relay.io/enabled: "true"
+        adbc-mesh.io/enabled: "true"
     resourceRules:
       - apiGroups: [""]
         apiVersions: ["v1"]
@@ -33,18 +33,18 @@ spec:
     - name: credentialVolumes
       expression: >-
         (has(object.spec.volumes) ? object.spec.volumes : []).filter(v,
-          (has(v.secret) && has(v.secret.secretName) && v.secret.secretName.startsWith("adbc-relay-")) ||
+          (has(v.secret) && has(v.secret.secretName) && v.secret.secretName.startsWith("adbc-mesh-")) ||
           (has(v.projected) && has(v.projected.sources) && v.projected.sources.exists(s,
-            has(s.secret) && has(s.secret.name) && s.secret.name.startsWith("adbc-relay-")))
+            has(s.secret) && has(s.secret.name) && s.secret.name.startsWith("adbc-mesh-")))
         ).map(v, v.name)
     - name: others
       expression: "variables.all.filter(c, c.name != 'relay-sidecar')"
   validations:
-    - message: "only an injected relay pod may reference adbc-relay credentials"
+    - message: "only an injected relay pod may reference adbc-mesh credentials"
       expression: >-
         size(variables.credentialVolumes) == 0 ||
-        (has(object.metadata.labels) && "adbc-relay.io/backend" in object.metadata.labels)
-    - message: "only relay-sidecar may mount adbc-relay credentials"
+        (has(object.metadata.labels) && "adbc-mesh.io/backend" in object.metadata.labels)
+    - message: "only relay-sidecar may mount adbc-mesh credentials"
       expression: >-
         variables.others.all(c, !has(c.volumeMounts) ||
           c.volumeMounts.all(m, !(m.name in variables.credentialVolumes)))
@@ -56,19 +56,19 @@ spec:
           !has(v.projected) || !has(v.projected.sources) || v.projected.sources.all(s,
             !has(s.serviceAccountToken) || !has(s.serviceAccountToken.audience) ||
             s.serviceAccountToken.audience != "vault" ||
-            (v.name == "relay-token" && has(object.metadata.labels) && "adbc-relay.io/backend" in object.metadata.labels)))
-    - message: "adbc-relay credentials may not be used through environment variables"
+            (v.name == "relay-token" && has(object.metadata.labels) && "adbc-mesh.io/backend" in object.metadata.labels)))
+    - message: "adbc-mesh credentials may not be used through environment variables"
       expression: >-
         variables.all.all(c,
           (!has(c.env) || c.env.all(e, !has(e.valueFrom) || !has(e.valueFrom.secretKeyRef) ||
-            !e.valueFrom.secretKeyRef.name.startsWith("adbc-relay-"))) &&
+            !e.valueFrom.secretKeyRef.name.startsWith("adbc-mesh-"))) &&
           (!has(c.envFrom) || c.envFrom.all(e, !has(e.secretRef) ||
-            !e.secretRef.name.startsWith("adbc-relay-"))))
+            !e.secretRef.name.startsWith("adbc-mesh-"))))
 ---
 apiVersion: policies.kyverno.io/v1
 kind: ValidatingPolicy
 metadata:
-  name: adbc-relay-pod-shape
+  name: adbc-mesh-pod-shape
 spec:
   failurePolicy: Fail
   validationActions: [Deny]
@@ -82,10 +82,10 @@ spec:
   matchConstraints:
     namespaceSelector:
       matchLabels:
-        adbc-relay.io/enabled: "true"
+        adbc-mesh.io/enabled: "true"
     objectSelector:
       matchExpressions:
-        - {key: adbc-relay.io/backend, operator: Exists}
+        - {key: adbc-mesh.io/backend, operator: Exists}
     resourceRules:
       - apiGroups: [""]
         apiVersions: ["v1"]
@@ -101,23 +101,55 @@ spec:
       expression: >-
         has(object.spec.securityContext) && has(object.spec.securityContext.runAsUser)
         ? object.spec.securityContext.runAsUser : 0
+    - name: isSparkDriver
+      expression: "has(object.spec.serviceAccountName) && object.spec.serviceAccountName == 'spark-driver'"
+    - name: sidecar
+      expression: "variables.init.filter(c, c.name == 'relay-sidecar')"
+    - name: podVolumes
+      expression: "has(object.spec.volumes) ? object.spec.volumes : []"
   validations:
-    - message: "relay pods must keep the adbc-relay.io/backend label"
-      expression: "has(object.metadata.labels) && 'adbc-relay.io/backend' in object.metadata.labels"
+    - message: "relay pods must keep the adbc-mesh.io/backend label"
+      expression: "has(object.metadata.labels) && 'adbc-mesh.io/backend' in object.metadata.labels"
     - message: "relay-sidecar must run first, with the approved image and no overrides"
       expression: >-
         size(variables.init) >= 1 &&
         variables.init[0].name == "relay-sidecar" && variables.init[0].image == "relay-sidecar:dev" &&
         !has(variables.init[0].command) &&
-        variables.init[0].args == ["/etc/adbc-relay/config.json"]
+        variables.init[0].args == ["/etc/adbc-mesh/config.json"]
+    # Injection skips a pod that already has a relay-sidecar, so a user can write one. It must be
+    # indistinguishable from the injected one: LD_PRELOAD or an extra mount would run user code next
+    # to the credentials, and a different secret could name any library as the driver.
+    - message: "relay-sidecar may not be customised"
+      expression: >-
+        size(variables.sidecar) == 1 && variables.sidecar.all(c,
+          !has(c.env) && !has(c.envFrom) && !has(c.lifecycle) && !has(c.workingDir) &&
+          !has(c.volumeDevices) && !has(c.livenessProbe) && !has(c.readinessProbe) &&
+          has(c.restartPolicy) && c.restartPolicy == "Always" &&
+          has(c.securityContext) && has(c.securityContext.runAsUser) && c.securityContext.runAsUser == 1337 &&
+          has(c.securityContext.readOnlyRootFilesystem) && c.securityContext.readOnlyRootFilesystem &&
+          has(c.securityContext.allowPrivilegeEscalation) && !c.securityContext.allowPrivilegeEscalation &&
+          has(c.startupProbe) && has(c.startupProbe.exec) &&
+          c.startupProbe.exec.command == ["test", "-S", "/run/adbc-mesh/postgres.sock"] &&
+          c.volumeMounts.map(m, m.name + "=" + m.mountPath).all(m, m in [
+            "relay-socket=/run/adbc-mesh", "relay-secret=/etc/adbc-mesh", "relay-token=/var/run/secrets/adbc-mesh"]) &&
+          size(c.volumeMounts) == 3)
+    - message: "relay volumes may not be customised"
+      expression: >-
+        variables.podVolumes.filter(v, v.name == "relay-secret").all(v, has(v.secret) && v.secret.secretName == "adbc-mesh-postgres") &&
+        variables.podVolumes.filter(v, v.name == "relay-socket").all(v, has(v.emptyDir)) &&
+        variables.podVolumes.filter(v, v.name == "relay-token").all(v, has(v.projected) && size(v.projected.sources) == 1 &&
+          v.projected.sources.all(s, has(s.serviceAccountToken) && has(s.serviceAccountToken.audience) && s.serviceAccountToken.audience == "vault"))
     - message: "relay pods may not share a process namespace"
       expression: "!(has(object.spec.shareProcessNamespace) && object.spec.shareProcessNamespace)"
+    # The one exception is the API server token of a Spark driver, which has to create executors. No
+    # audience means the API server, so this token isn't accepted where relay-token is.
     - message: "relay pods may not mount other service account tokens"
       expression: >-
-        has(object.spec.automountServiceAccountToken) && !object.spec.automountServiceAccountToken &&
+        (variables.isSparkDriver || (has(object.spec.automountServiceAccountToken) && !object.spec.automountServiceAccountToken)) &&
         (!has(object.spec.volumes) || object.spec.volumes.all(v,
           (!has(v.projected) || !has(v.projected.sources) || v.projected.sources.all(s, !has(s.serviceAccountToken) ||
-            (v.name == "relay-token" && has(s.serviceAccountToken.audience) && s.serviceAccountToken.audience == "vault")))))
+            (v.name == "relay-token" && has(s.serviceAccountToken.audience) && s.serviceAccountToken.audience == "vault") ||
+            (variables.isSparkDriver && v.name.startsWith("kube-api-access-") && !has(s.serviceAccountToken.audience))))))
     - message: "only relay-sidecar may mount the service account token"
       expression: >-
         variables.untrusted.all(c, !has(c.volumeMounts) || c.volumeMounts.all(m, m.name != "relay-token"))
@@ -142,7 +174,7 @@ spec:
 apiVersion: policies.kyverno.io/v1
 kind: ValidatingPolicy
 metadata:
-  name: adbc-relay-namespace-hardening
+  name: adbc-mesh-namespace-hardening
 spec:
   failurePolicy: Fail
   validationActions: [Deny]
@@ -156,7 +188,7 @@ spec:
   matchConstraints:
     namespaceSelector:
       matchLabels:
-        adbc-relay.io/enabled: "true"
+        adbc-mesh.io/enabled: "true"
     resourceRules:
       - apiGroups: [""]
         apiVersions: ["v1"]
@@ -185,13 +217,13 @@ spec:
     # With Vault, the service account decides what data a pod can read, and the pod creator picks it.
     - message: "pods in this namespace must use an approved service account"
       expression: >-
-        !has(object.spec.serviceAccountName) || object.spec.serviceAccountName in ["default"]
+        !has(object.spec.serviceAccountName) || object.spec.serviceAccountName in ["default", "spark-driver", "spark-executor"]
 ---
 # Pod Security is built into the API server, so it keeps working when Kyverno doesn't.
 apiVersion: policies.kyverno.io/v1
 kind: ValidatingPolicy
 metadata:
-  name: adbc-relay-namespace-pod-security
+  name: adbc-mesh-namespace-pod-security
 spec:
   failurePolicy: Fail
   validationActions: [Deny]
@@ -205,14 +237,14 @@ spec:
   matchConstraints:
     objectSelector:
       matchLabels:
-        adbc-relay.io/enabled: "true"
+        adbc-mesh.io/enabled: "true"
     resourceRules:
       - apiGroups: [""]
         apiVersions: ["v1"]
         operations: ["CREATE", "UPDATE"]
         resources: ["namespaces"]
   validations:
-    - message: "namespaces with adbc-relay enabled must enforce the baseline or restricted Pod Security Standard"
+    - message: "namespaces with adbc-mesh enabled must enforce the baseline or restricted Pod Security Standard"
       expression: >-
         "pod-security.kubernetes.io/enforce" in object.metadata.labels &&
         object.metadata.labels["pod-security.kubernetes.io/enforce"] in ["baseline", "restricted"]
